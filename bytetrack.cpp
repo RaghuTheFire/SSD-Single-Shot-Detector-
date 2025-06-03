@@ -1,4 +1,4 @@
-// bytetrack.cpp (enhanced with Kalman filtering and velocity estimation)
+// bytetrack.cpp with velocity smoothing (exponential moving average)
 #include "bytetrack.h"
 #include <opencv2/video/tracking.hpp>
 #include <algorithm>
@@ -19,7 +19,7 @@ float computeIoU(const Rect& a, const Rect& b) {
 }
 
 KalmanFilter ByteTrack::createKalmanFilter(const Rect& bbox) {
-    KalmanFilter kf(4, 2, 0); // [x, y, dx, dy] → [x, y]
+    KalmanFilter kf(4, 2, 0);
     kf.transitionMatrix = (Mat_<float>(4, 4) << 1,0,1,0, 0,1,0,1, 0,0,1,0, 0,0,0,1);
     kf.measurementMatrix = Mat::eye(2, 4, CV_32F);
     setIdentity(kf.processNoiseCov, Scalar::all(1e-2));
@@ -68,7 +68,10 @@ vector<Track> ByteTrack::update(const vector<Detection>& detections) {
             Mat measurement = (Mat_<float>(2,1) << meas.x, meas.y);
             track.kf.correct(measurement);
             Point new_center = predictCenter(track.kf);
-            track.velocity = new_center - Point(track.bbox.x + track.bbox.width/2, track.bbox.y + track.bbox.height/2);
+            Point new_velocity = new_center - Point(track.bbox.x + track.bbox.width/2, track.bbox.y + track.bbox.height/2);
+            track.velocity = new_velocity;
+            track.smoothed_velocity.x = static_cast<int>((1 - smoothing_factor) * track.smoothed_velocity.x + smoothing_factor * new_velocity.x);
+            track.smoothed_velocity.y = static_cast<int>((1 - smoothing_factor) * track.smoothed_velocity.y + smoothing_factor * new_velocity.y);
             track.bbox = Rect(new_center.x - det.bbox.width / 2, new_center.y - det.bbox.height / 2,
                               det.bbox.width, det.bbox.height);
             track.class_id = det.class_id;
@@ -91,6 +94,7 @@ vector<Track> ByteTrack::update(const vector<Detection>& detections) {
             new_track.age = 0;
             new_track.kf = createKalmanFilter(detections[i].bbox);
             new_track.velocity = Point(0, 0);
+            new_track.smoothed_velocity = Point(0, 0);
             updated_tracks.push_back(new_track);
         }
     }
