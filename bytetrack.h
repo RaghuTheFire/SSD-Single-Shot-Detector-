@@ -1,6 +1,7 @@
-// bytetrack.h
+// bytetrack.h (enhanced with Kalman filtering + velocity smoothing)
 #pragma once
 #include <opencv2/core.hpp>
+#include <opencv2/video/tracking.hpp>
 #include <vector>
 
 struct Detection {
@@ -14,6 +15,9 @@ struct Track {
     cv::Rect bbox;
     int class_id;
     int age;
+    cv::KalmanFilter kf;
+    cv::Point velocity;           // Instantaneous velocity
+    cv::Point smoothed_velocity; // Smoothed velocity using EMA
 };
 
 class ByteTrack {
@@ -25,4 +29,8 @@ private:
     std::vector<Track> tracks;
     int max_age;
     float iou_threshold;
+    float smoothing_factor = 0.5f; // EMA factor (0.0–1.0)
+
+    cv::KalmanFilter createKalmanFilter(const cv::Rect& bbox);
+    cv::Point predictCenter(cv::KalmanFilter& kf);
 };
