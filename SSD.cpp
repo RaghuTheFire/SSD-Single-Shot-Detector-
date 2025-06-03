@@ -1,117 +1,151 @@
-#include <iostream>
+// mobilenet_ssd_tracker.cpp (updated with RTSP, snapshots, consistent colors)
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
 #include <tbb/concurrent_queue.h>
 #include <thread>
+#include <atomic>
 #include <vector>
+#include <chrono>
 #include <random>
+#include <iostream>
+#include "bytetrack.h"
 
 using namespace cv;
 using namespace std;
 
-// Configuration parameters
 bool use_gpu = true;
-bool live_video = false; // Set to true for live video feed, false for video file
-float confidence_level = 0.5; // Minimum confidence level for object detection
+bool live_video = true;
+string video_source = "rtsp://your_rtsp_stream";
+float confidence_threshold = 0.5;
+float iou_threshold = 0.3;
 
-// Define the classes for which the model can detect objects
-const vector<string> CLASSES = {"background", "aeroplane", "bicycle", "bird", "boat",
-                                 "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
-                                 "dog", "horse", "motorbike", "person", "pottedplant", "sheep",
-                                 "sofa", "train", "tvmonitor"};
+vector<string> CLASSES = {"background", "aeroplane", "bicycle", "bird", "boat",
+                          "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
+                          "dog", "horse", "motorbike", "person", "pottedplant", "sheep",
+                          "sofa", "train", "tvmonitor"};
 
-// Generate random COLORS for each class
 vector<Vec3b> COLORS(CLASSES.size());
-void generateColors() {
-    random_device rd;
-    mt19937 gen(rd());
-    uniform_real_distribution<> dis(0, 255);
-    for (size_t i = 0; i < CLASSES.size(); ++i) {
-        COLORS[i] = Vec3b(dis(gen), dis(gen), dis(gen));
+void generateConsistentColors() {
+    for (size_t i = 0; i < COLORS.size(); ++i) {
+        int r = (i * 123) % 255;
+        int g = (i * 321) % 255;
+        int b = (i * 231) % 255;
+        COLORS[i] = Vec3b(b, g, r);
     }
 }
 
-// Function to process frames
-void processFrames(tbb::concurrent_bounded_queue<Mat>& frameQueue, Net& net) {
-    while (true) {
-        Mat frame;
-        if (frameQueue.try_pop(frame)) {
-            // Prepare the frame for object detection
-            Mat blob;
-            cv::dnn::blobFromImage(frame, blob, 0.007843, Size(300, 300), Scalar(127.5));
-            net.setInput(blob);
-            Mat detections = net.forward();
+atomic<bool> keepRunning(true);
+tbb::concurrent_bounded_queue<Mat> frameQueue;
 
-            int h = frame.rows;
-            int w = frame.cols;
+void captureFrames(VideoCapture& cap) 
+{
+    Mat frame;
+    while (keepRunning) 
+    {
+        if (!cap.read(frame)) break;
+        frameQueue.push(frame.clone());
+    }
+}
 
-            // Loop over the detections
-            for (int i = 0; i < detections.size[2]; i++) {
-                float confidence = detections.at<float>(0, 0, i, 2);
+void processFrames(Net& net) 
+{
+    ByteTrack tracker(30, iou_threshold);
+    Mat frame;
+    auto start = chrono::steady_clock::now();
+    int frameCount = 0;
+    float fps = 0.0f;
+    int snap_id = 0;
 
-                // Check if the confidence level is above the threshold
-                if (confidence > confidence_level) {
-                    int idx = static_cast<int>(detections.at<float>(0, 0, i, 1));
-                    Rect box = Rect(detections.at<float>(0, 0, i, 3) * w,
-                                    detections.at<float>(0, 0, i, 4) * h,
-                                    (detections.at<float>(0, 0, i, 5) - detections.at<float>(0, 0, i, 3)) * w,
-                                    (detections.at<float>(0, 0, i, 6) - detections.at<float>(0, 0, i, 4)) * h);
+    while (keepRunning) 
+    {
+        if (!frameQueue.try_pop(frame)) continue;
 
-                    // Draw a bounding box and label around the detected object
-                    string label = format("%s: %.2f%%", CLASSES[idx].c_str(), confidence * 100);
-                    rectangle(frame, box, COLORS[idx], 2);
-                    int y = box.y - 15 < 15 ? box.y + 15 : box.y - 15;
-                    putText(frame, label, Point(box.x, y), FONT_HERSHEY_DUPLEX, 0.5, COLORS[idx], 1);
-                }
+        Mat blob;
+        blobFromImage(frame, blob, 0.007843, Size(300, 300), Scalar(127.5, 127.5, 127.5), false);
+        net.setInput(blob);
+        Mat detections = net.forward();
+
+        vector<Detection> validDetections;
+        int h = frame.rows, w = frame.cols;
+
+        for (int i = 0; i < detections.size[2]; ++i) 
+        {
+            float confidence = detections.at<float>(0, 0, i, 2);
+            if (confidence > confidence_threshold) 
+            {
+                int class_id = static_cast<int>(detections.at<float>(0, 0, i, 1));
+                int xLeftBottom = static_cast<int>(detections.at<float>(0, 0, i, 3) * w);
+                int yLeftBottom = static_cast<int>(detections.at<float>(0, 0, i, 4) * h);
+                int xRightTop = static_cast<int>(detections.at<float>(0, 0, i, 5) * w);
+                int yRightTop = static_cast<int>(detections.at<float>(0, 0, i, 6) * h);
+                Rect box(xLeftBottom, yLeftBottom, xRightTop - xLeftBottom, yRightTop - yLeftBottom);
+
+                validDetections.push_back({box, class_id, confidence});
             }
+        }
 
-            // Display the frame
-            imshow("Live detection", frame);
-            if (waitKey(1) == 27) break; // Break the loop if the 'Esc' key is pressed
+        vector<Track> tracks = tracker.update(validDetections);
+
+        for (const auto& t : tracks) 
+        {
+            rectangle(frame, t.bbox, COLORS[t.class_id], 2);
+            string label = format("%s #%d", CLASSES[t.class_id].c_str(), t.track_id);
+            putText(frame, label, Point(t.bbox.x, t.bbox.y - 10), FONT_HERSHEY_SIMPLEX, 0.5, COLORS[t.class_id], 2);
+        }
+
+        frameCount++;
+        if (frameCount % 10 == 0) 
+        {
+            auto end = chrono::steady_clock::now();
+            float seconds = chrono::duration_cast<chrono::milliseconds>(end - start).count() / 1000.0;
+            fps = frameCount / seconds;
+            frameCount = 0;
+            start = chrono::steady_clock::now();
+        }
+
+        putText(frame, format("FPS: %.2f", fps), Point(10, 20), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
+        imshow("SSD + Tracker", frame);
+        int key = waitKey(1);
+        if (key == 27) keepRunning = false;
+        if (key == 's' || key == 'S') 
+        {
+            string filename = format("snapshot_%d.jpg", snap_id++);
+            imwrite(filename, frame);
+            cout << "[INFO] Snapshot saved: " << filename << endl;
         }
     }
 }
 
-int main() {
-    // Load pre-trained MobileNet SSD model
-    Net net = cv::dnn::readNetFromCaffe("ssd_files/MobileNetSSD_deploy.prototxt",
-                                         "ssd_files/MobileNetSSD_deploy.caffemodel");
+int main() 
+{
+    generateConsistentColors();
 
-    // Set backend and target to CUDA if GPU is enabled
-    if (use_gpu) {
-        cout << "[INFO] setting preferable backend and target to CUDA..." << endl;
-        net.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
-        net.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
+    Net net = dnn::readNetFromCaffe("ssd_files/MobileNetSSD_deploy.prototxt",
+                                    "ssd_files/MobileNetSSD_deploy.caffemodel");
+    if (net.empty()) {
+        cerr << "Failed to load SSD model." << endl;
+        return -1;
+    }
+    if (use_gpu) 
+    {
+        net.setPreferableBackend(dnn::DNN_BACKEND_CUDA);
+        net.setPreferableTarget(dnn::DNN_TARGET_CUDA);
     }
 
-    // Open a video stream (live or from a file)
-    cout << "[INFO] accessing video stream..." << endl;
-    VideoCapture vs(live_video ? 0 : "test-2.mp4");
-    if (!vs.isOpened()) {
-        cerr << "Error: Could not open video." << endl;
+    VideoCapture cap(live_video ? video_source : 0);
+    if (!cap.isOpened()) 
+    {
+        cerr << "Error: Cannot open video source." << endl;
         return -1;
     }
 
-    // Generate random colors
-    generateColors();
+    frameQueue.set_capacity(10);
 
-    // Create a queue for frame exchange
-    tbb::concurrent_bounded_queue<Mat> frameQueue;
+    thread producer(captureFrames, ref(cap));
+    thread consumer(processFrames, ref(net));
 
-    // Start a thread for processing frames
-    thread processingThread(processFrames, ref(frameQueue), ref(net));
+    producer.join();
+    consumer.join();
 
-    // Main video processing loop
-    Mat frame;
-    while (true) {
-        if (!vs.read(frame)) break; // Read a frame from the video source
-        frameQueue.push(frame); // Push the frame to the queue
-    }
-
-    // Wait for the processing thread to finish
-    processingThread.join();
-
-    cout << "[INFO] Video processing finished." << endl;
     return 0;
 }
-
